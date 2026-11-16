@@ -1,0 +1,109 @@
+
+name: RDP
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: 'OS Type'
+        required: true
+        default: 'windows'
+      region:
+        description: 'Ngrok Region'
+        required: true
+        default: 'eu'
+      password:
+        description: 'Server Password'
+        required: true
+        default: 'EntPass2026'
+      duration:
+        description: 'Duration in minutes'
+        required: true
+        default: '180'
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: ${{ fromJSON(github.event.inputs.duration) }}
+    steps:
+      - name: Configure RDP
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          # حذف قاعدة الجدار القديمة إن وُجدت ثم إضافتها
+          netsh advfirewall firewall delete rule name="RDP" 2>$null
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+          Start-Sleep -Seconds 3
+
+      - name: Create Random User & Password
+        shell: powershell
+        env:
+          RAW_PASSWORD: ${{ github.event.inputs.password }}
+        run: |
+          # here-string مفرد لتجنب تفسير $ و " داخل كلمة المرور
+          $password = @'
+          $env:RAW_PASSWORD
+          '@
+          $password = $password.Trim()
+          $username = "User" + (Get-Random -Minimum 1000 -Maximum 9999)
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+          echo "RDP_USER=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+      - name: Verify RDP is listening
+        shell: powershell
+        run: |
+          $ok = Test-NetConnection -ComputerName localhost -Port 3389 -InformationLevel Quiet
+          if (-not $ok) { throw "RDP port 3389 is not listening" }
+          Write-Host "RDP port is listening."
+
+      - name: Install Ngrok
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile "ngrok.zip"
+          Expand-Archive -Path "ngrok.zip" -DestinationPath "C:\ngrok" -Force
+          C:\ngrok\ngrok.exe config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+
+      - name: Start Ngrok Tunnel
+        shell: powershell
+        run: |
+          Start-Process -FilePath "C:\ngrok\ngrok.exe" -ArgumentList "tcp 3389 --region ${{ github.event.inputs.region }} --log stdout" -NoNewWindow -RedirectStandardOutput "C:\ngrok\ngrok.log"
+          # انتظر حتى يظهر الـ tunnel في الـ API
+          $url = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            try {
+              $api = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -ErrorAction Stop
+              if ($api.tunnels -and $api.tunnels.Count -gt 0) {
+                $url = $api.tunnels[0].public_url
+                break
+              }
+            } catch { }
+          }
+          if (-not $url) {
+            Write-Host "---- ngrok log ----"
+            Get-Content "C:\ngrok\ngrok.log" -ErrorAction SilentlyContinue
+            throw "Ngrok tunnel did not start. Check ngrok log above."
+          }
+          echo "NGROK_URL=$url" >> $env:GITHUB_ENV
+
+      - name: Print Credentials
+        shell: powershell
+        run: |
+          Write-Host "=== RDP ACCESS ==="
+          Write-Host "Address: $env:NGROK_URL"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASS"
+          Write-Host "=== END ACCESS ==="
+
+      - name: Keep Alive
+        shell: powershell
+        run: |
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Active..."
+            Start-Sleep -Seconds 300
+          }
